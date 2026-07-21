@@ -31,7 +31,7 @@ final readonly class MarkOrderAsPaid {
 			}
 		);
 
-		// todo: dispatch event
+		OrderPaymentSuccessful::dispatch( $order );
 
 		return $order;
 	}
