@@ -21,7 +21,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 		'paid_at',
 	)
 )]
-class Orders extends Model {
+class Order extends Model {
 
 	protected function casts(): array {
 		return array(
