@@ -1,58 +1,184 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Order Payment Success — Event-Driven Architecture Demo
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+A Laravel 11 implementation of an order-payment-success endpoint, built to demonstrate
+senior-level architecture: skinny controllers, a transactional Action class, and an
+event-driven fan-out to queued listeners for side effects (email, inventory, cart).
 
-## About Laravel
+## Why this architecture
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+When a payment succeeds, multiple unrelated things need to happen: confirm the order,
+email the customer, decrement stock, clear the cart. Bundling all of that into one
+controller method (or one service class) creates a class that grows every time a new
+stakeholder wants a new side effect, and couples unrelated concerns to a single point
+of failure.
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+This project separates two concerns:
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+1. **The fact**: the order was paid. This is the only thing handled synchronously,
+   inside a database transaction, with an idempotency guard against duplicate webhook
+   calls.
+2. **The consequences**: everything that should happen as a result. These are modeled
+   as an `OrderPaymentSuccessful` event with independent, queued listeners. Adding a
+   new side effect (Slack alert, loyalty points, analytics) means adding a new listener
+   class — no changes to the controller, the action, or any existing listener.
 
-## Learning Laravel
+Queuing the listeners also means the HTTP response returns immediately rather than
+waiting on SMTP or third-party APIs, which matters because payment gateways generally
+enforce webhook response-time / retry policies.
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
+## Request flow
 
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
-
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
-
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
-
-```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+```
+POST /api/orders/{order:reference}/payment-success
+        │
+        ▼
+ConfirmOrderPaymentRequest   (validates payload, builds a typed DTO)
+        │
+        ▼
+OrderPaymentController        (HTTP concerns only)
+        │
+        ▼
+MarkOrderAsPaid Action        (DB transaction, idempotency guard)
+        │
+        ▼
+OrderPaymentSuccessful event  (dispatched after commit)
+        │
+        ├──► SendOrderConfirmationEmail   (queue: emails)
+        ├──► ReduceProductInventory       (queue: inventory)
+        └──► ClearUserCart                (queue: default)
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+## Project structure
 
-## Contributing
+```
+app/
+├── Actions/Orders/
+│   └── MarkOrderAsPaid.php              # Transactional status update + idempotency check
+├── DataTransferObjects/
+│   └── PaymentConfirmationData.php      # Readonly DTO for the validated payload
+├── Enums/
+│   └── OrderStatus.php                  # Backed enum: pending|paid|failed|refunded
+├── Events/
+│   └── OrderPaymentSuccessful.php       # Fired once the order is committed as paid
+├── Exceptions/
+│   └── OrderAlreadyPaidException.php    # Guards against duplicate webhook delivery
+├── Http/
+│   ├── Controllers/Api/
+│   │   └── OrderPaymentController.php   # Skinny, single-action controller
+│   ├── Requests/
+│   │   └── ConfirmOrderPaymentRequest.php
+│   └── Resources/
+│       └── OrderResource.php
+├── Listeners/
+│   ├── SendOrderConfirmationEmail.php   # ShouldQueue, queue: emails
+│   ├── ReduceProductInventory.php       # ShouldQueue, queue: inventory
+│   └── ClearUserCart.php                # ShouldQueue
+├── Mail/
+│   └── OrderConfirmationMail.php
+└── Models/
+    ├── Order.php
+    ├── OrderItem.php
+    ├── Product.php
+    ├── Cart.php
+    └── CartItem.php
+```
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+## Setup
 
-## Code of Conduct
+```bash
+composer install
+cp .env.example .env
+php artisan key:generate
+```
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+Configure the queue driver in `.env`:
 
-## Security Vulnerabilities
+```
+QUEUE_CONNECTION=database
+```
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+Run migrations:
 
-## License
+```bash
+php artisan queue:table
+php artisan migrate
+```
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+## Running locally
+
+```bash
+php artisan serve
+```
+
+In a second terminal, run a queue worker so the listeners actually process:
+
+```bash
+php artisan queue:work --queue=emails,inventory,default
+```
+
+### Example request
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/orders/ORD-1234AB/payment-success \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "payment_intent_id": "pi_mock_123",
+    "payment_gateway": "mock",
+    "amount_paid_cents": 4999,
+    "currency": "USD"
+  }'
+```
+
+Response:
+
+```json
+{
+    "data": {
+        "reference": "ORD-1234AB",
+        "status": "paid",
+        "total_cents": 4999,
+        "currency": "USD",
+        "paid_at": "2026-07-23T10:15:00+00:00"
+    }
+}
+```
+
+## Idempotency
+
+Payment webhooks are frequently delivered more than once by gateways. Calling this
+endpoint on an order that is already `paid` throws `OrderAlreadyPaidException` rather
+than re-processing the payment or re-firing side effects.
+
+## Testing
+
+```bash
+php artisan test
+```
+
+Covers:
+
+- `MarkOrderAsPaidTest` — the action correctly transitions status, sets `paid_at`,
+  dispatches the event, and rejects already-paid orders.
+- `OrderPaymentControllerTest` — the full HTTP flow, validation failures, and the
+  event dispatch from a real request.
+
+## Extending
+
+To add a new side effect (e.g. a Slack notification):
+
+1. `php artisan make:listener NotifySlackChannel`
+2. Implement `ShouldQueue`, add the `#[AsListener(event: OrderPaymentSuccessful::class)]` attribute
+3. That's it — no other file needs to change.
+
+## Key design decisions
+
+| Decision                                           | Reasoning                                                                                                                                             |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Single-action controller                           | Controller has one job: translate HTTP in, HTTP out. No branching logic.                                                                              |
+| DTO instead of raw arrays                          | Static typing survives from the Form Request through the Action; no stringly-typed array access downstream.                                           |
+| Backed enum for status                             | No magic strings (`'paid'`) scattered across the codebase; IDEs and static analysis catch typos.                                                      |
+| Event dispatched after `DB::transaction()` commits | Listeners never act on data that could still be rolled back.                                                                                          |
+| Each listener implements `ShouldQueue`             | Response to the payment gateway returns immediately; side effects don't block or risk timing out the webhook.                                         |
+| Per-listener queue names                           | Inventory and email volume can be scaled/prioritized independently by dedicating workers per queue.                                                   |
+| No repository pattern                              | Eloquent models plus a single Action class is sufficient at this scope — an extra abstraction layer here would be over-engineering, not architecture. |
